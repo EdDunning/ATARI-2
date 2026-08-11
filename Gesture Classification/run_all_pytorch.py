@@ -282,6 +282,7 @@ python "Gesture Classification/run_all_pytorch.py" `
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -322,16 +323,38 @@ VENV_PYTHON = (
 )
 
 
+CUDA_VENV_PYTHON = (
+    PROJECT_ROOT
+    / ".venv312"
+    / "Scripts"
+    / "python.exe"
+)
+
+
 def resolve_python_executable() -> str:
     """
-    Prefer the workspace .venv interpreter whenever it exists and can import
-    the PyTorch runtime stack. Otherwise fall back to the interpreter that is
-    currently running this launcher.
+    Prefer a workspace interpreter that already has the CUDA-enabled PyTorch
+    stack installed. Otherwise fall back to the interpreter that is currently
+    running this launcher.
     """
 
-    if VENV_PYTHON.exists():
+    override = os.environ.get("ATARI_PYTHON")
+    if override:
+        override_path = Path(override)
+        if override_path.exists():
+            return str(override_path)
+
+    candidate_pythons = [
+        CUDA_VENV_PYTHON,
+        VENV_PYTHON,
+    ]
+
+    for candidate in candidate_pythons:
+        if not candidate.exists():
+            continue
+
         probe = [
-            str(VENV_PYTHON),
+            str(candidate),
             "-c",
             "import torch, torchvision, torchaudio, pandas; print('ok')",
         ]
@@ -343,10 +366,10 @@ def resolve_python_executable() -> str:
                 stderr=subprocess.DEVNULL,
             )
         except Exception:
-            return sys.executable
+            continue
 
         if result.returncode == 0:
-            return str(VENV_PYTHON)
+            return str(candidate)
 
     return sys.executable
 

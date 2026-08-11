@@ -1,9 +1,11 @@
-# Large generated archive artifacts that GitHub rejects for this repository
-Archive results/XGBoost Gesture Prediction/outputs_all_trials/prepared_data/all_window_features.csv
-Archive results/XGBoost Gesture Prediction/outputs_all_trials/prepared_data/all_frame_level.csv
-Archive results/XGBoost Gesture Prediction/outputs_knot_tying_only/prepared_data/all_window_features.csv
-
-# Optional: keep local runtime/model outputs out of source control unless needed
+# Large generated archive artifacts and local environments
+Archive results/
 outputs_pytorch/
+outputs_pytorch_single_procedure/
+.venv/
+.venv312/
+
+# Python bytecode and model artifacts
 __pycache__/
 *.pyc
+*.pt
