@@ -293,6 +293,120 @@ def load_annotations(path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 # Label alignment
 # ---------------------------------------------------------------------
+def validate_annotation_alignment(
+    n_frames: int,
+    annotations: pd.DataFrame,
+    frame_index_base: int,
+    inclusive_end: bool,
+    trial_id: str,
+) -> None:
+    """
+    Validate that gesture annotations can be aligned safely to the raw
+    kinematic frame sequence.
+
+    Checks:
+        - all gesture labels are recognised
+        - annotation intervals are valid
+        - converted intervals overlap the recorded kinematic sequence
+        - annotations do not overlap each other after conversion
+    """
+
+    if annotations.empty:
+        raise ValueError(
+            f"{trial_id}: annotation table is empty."
+        )
+
+    unknown = annotations.loc[
+        annotations["gesture_id"] < 0,
+        "gesture_label",
+    ].unique()
+
+    if len(unknown) > 0:
+        raise ValueError(
+            f"{trial_id}: unknown gesture labels found: "
+            f"{sorted(map(str, unknown))}"
+        )
+
+    occupied = np.zeros(
+        n_frames,
+        dtype=bool,
+    )
+
+    previous_start = None
+
+    for row_number, row in annotations.iterrows():
+        start_frame = int(row["start_frame"])
+        end_frame = int(row["end_frame"])
+
+        if end_frame < start_frame:
+            raise ValueError(
+                f"{trial_id}: invalid annotation interval "
+                f"{start_frame}-{end_frame}."
+            )
+
+        if (
+            previous_start is not None
+            and start_frame < previous_start
+        ):
+            raise ValueError(
+                f"{trial_id}: annotation intervals are not "
+                "in chronological order."
+            )
+
+        previous_start = start_frame
+
+        start_idx, end_idx = _normalise_annotation_bounds(
+            start_frame=start_frame,
+            end_frame=end_frame,
+            frame_index_base=frame_index_base,
+            inclusive_end=inclusive_end,
+        )
+
+        if end_idx < 0 or start_idx >= n_frames:
+            raise ValueError(
+                f"{trial_id}: annotation "
+                f"{start_frame}-{end_frame} lies completely "
+                "outside the kinematic recording."
+            )
+
+        clipped_start = max(
+            0,
+            start_idx,
+        )
+
+        clipped_end = min(
+            n_frames - 1,
+            end_idx,
+        )
+
+        if occupied[
+            clipped_start : clipped_end + 1
+        ].any():
+            raise ValueError(
+                f"{trial_id}: overlapping gesture annotations "
+                f"detected around frames "
+                f"{start_frame}-{end_frame}."
+            )
+
+        occupied[
+            clipped_start : clipped_end + 1
+        ] = True
+
+    annotated_frames = int(
+        occupied.sum()
+    )
+
+    background_frames = (
+        n_frames - annotated_frames
+    )
+
+    print(
+        f"[ALIGNMENT] {trial_id}: "
+        f"{len(annotations)} annotation intervals | "
+        f"{annotated_frames}/{n_frames} frames annotated | "
+        f"{background_frames} background/unannotated frames"
+    )
+
 
 def _normalise_annotation_bounds(
     start_frame: int,
@@ -613,7 +727,17 @@ def prepare_trial(
     annotations = load_annotations(annotations_path)
 
     if kinematics.shape[0] == 0:
-        raise ValueError(f"{kinematics_path.name}: no kinematic frames found")
+        raise ValueError(
+            f"{kinematics_path.name}: no kinematic frames found"
+        )
+
+    validate_annotation_alignment(
+        n_frames=kinematics.shape[0],
+        annotations=annotations,
+        frame_index_base=config.frame_index_base,
+        inclusive_end=config.inclusive_end,
+        trial_id=trial_id,
+            )
 
     frame_labels = build_frame_labels(
         n_frames=kinematics.shape[0],

@@ -285,355 +285,81 @@ import argparse
 import os
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-
-# =============================================================================
-# PROJECT PATHS
-# =============================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-
-DATA_PREP_SCRIPT = (
-    PROJECT_ROOT
-    / "Gesture Data Manipulation"
-    / "data_prep.py"
-)
-
-TRAIN_SCRIPT = (
-    SCRIPT_DIR
-    / "Train_PyTorch.py"
-)
-
-PREDICT_SCRIPT = (
-    SCRIPT_DIR
-    / "predict_gestures.py"
-)
-
-VENV_PYTHON = (
-    PROJECT_ROOT
-    / ".venv"
-    / "Scripts"
-    / "python.exe"
-)
+DATA_PREP_SCRIPT = PROJECT_ROOT / "Gesture Data Manipulation" / "data_prep.py"
+TRAIN_SCRIPT = SCRIPT_DIR / "Train_PyTorch.py"
+PREDICT_SCRIPT = SCRIPT_DIR / "predict_gestures.py"
+VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+CUDA_VENV_PYTHON = PROJECT_ROOT / ".venv312" / "Scripts" / "python.exe"
 
 
-CUDA_VENV_PYTHON = (
-    PROJECT_ROOT
-    / ".venv312"
-    / "Scripts"
-    / "python.exe"
-)
+@dataclass(frozen=True)
+class TestPreset:
+    name: str
+    epochs: int
+    max_trials: Optional[int]
+    max_folds: Optional[int]
+    max_windows: Optional[int]
+    description: str
+
+
+PRESETS = {
+    "smoke": TestPreset("smoke", 1, 2, 2, 1000, "Small integration test."),
+    "single": TestPreset("single", 15, None, None, None, "One-procedure LOUO."),
+    "full": TestPreset("full", 15, None, None, None, "Multi-procedure LOUO."),
+}
 
 
 def resolve_python_executable() -> str:
-    """
-    Prefer a workspace interpreter that already has the CUDA-enabled PyTorch
-    stack installed. Otherwise fall back to the interpreter that is currently
-    running this launcher.
-    """
-
     override = os.environ.get("ATARI_PYTHON")
-    if override:
-        override_path = Path(override)
-        if override_path.exists():
-            return str(override_path)
-
-    candidate_pythons = [
-        CUDA_VENV_PYTHON,
-        VENV_PYTHON,
-    ]
-
-    for candidate in candidate_pythons:
-        if not candidate.exists():
-            continue
-
-        probe = [
-            str(candidate),
-            "-c",
-            "import torch, torchvision, torchaudio, pandas; print('ok')",
-        ]
-
-        try:
-            result = subprocess.run(
-                probe,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            continue
-
-        if result.returncode == 0:
-            return str(candidate)
-
+    if override and Path(override).exists():
+        return override
+    for candidate in (CUDA_VENV_PYTHON, VENV_PYTHON):
+        if candidate.exists():
+            try:
+                result = subprocess.run(
+                    [str(candidate), "-c", "import torch, pandas"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                continue
+            if result.returncode == 0:
+                return str(candidate)
     return sys.executable
 
 
 PYTHON_EXECUTABLE = resolve_python_executable()
 
 
-# =============================================================================
-# TEST PRESETS
-# =============================================================================
-
-@dataclass(frozen=True)
-class TestPreset:
-    name: str
-
-    epochs: int
-
-    max_trials: Optional[int]
-    max_folds: Optional[int]
-    max_windows: Optional[int]
-
-    description: str
+def require_script(path: Path) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"Required script was not found: {path}")
 
 
-PRESETS = {
-
-    "smoke": TestPreset(
-        name="smoke",
-        epochs=1,
-        max_trials=2,
-        max_folds=2,
-        max_windows=1000,
-        description=(
-            "Small integration and hardware test. "
-            "Not intended for accuracy measurement."
-        ),
-    ),
-
-    "single": TestPreset(
-        name="single",
-        epochs=15,
-        max_trials=None,
-        max_folds=None,
-        max_windows=None,
-        description=(
-            "Full LOUO Transformer experiment using "
-            "one supplied surgical procedure."
-        ),
-    ),
-
-    "full": TestPreset(
-        name="full",
-        epochs=15,
-        max_trials=None,
-        max_folds=None,
-        max_windows=None,
-        description=(
-            "Full multi-task LOUO Transformer experiment "
-            "using all supplied surgical procedures."
-        ),
-    ),
-}
-
-
-# =============================================================================
-# FORMATTING
-# =============================================================================
-
-def separator() -> None:
-    print()
-    print("=" * 79)
-    print()
-
-
-def format_duration(seconds: float) -> str:
-
-    seconds = max(
-        0,
-        int(round(seconds)),
-    )
-
-    hours, remainder = divmod(
-        seconds,
-        3600,
-    )
-
-    minutes, seconds = divmod(
-        remainder,
-        60,
-    )
-
-    parts: List[str] = []
-
-    if hours:
-        parts.append(
-            f"{hours} hr"
-        )
-
-    if minutes or hours:
-        parts.append(
-            f"{minutes} min"
-        )
-
-    parts.append(
-        f"{seconds} sec"
-    )
-
-    return " ".join(parts)
-
-
-def timestamp() -> str:
-    return datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-
-# =============================================================================
-# VALIDATION
-# =============================================================================
-
-def require_script(
-    path: Path,
-) -> None:
-
-    if not path.exists():
-        raise FileNotFoundError(
-            "\nRequired script was not found:\n"
-            f"{path}\n"
-        )
-
-
-def require_directory(
-    path: Path,
-    description: str,
-) -> None:
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"\nCould not find {description}:\n"
-            f"{path}\n"
-        )
-
+def require_directory(path: Path, description: str) -> None:
     if not path.is_dir():
-        raise NotADirectoryError(
-            f"\nExpected a directory for "
-            f"{description}:\n"
-            f"{path}\n"
-        )
+        raise NotADirectoryError(f"Expected {description}: {path}")
 
 
-def require_file(
-    path: Path,
-    description: str,
-) -> None:
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"\nCould not find {description}:\n"
-            f"{path}\n"
-        )
+def require_file(path: Path, description: str) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"Could not find {description}: {path}")
 
 
-# =============================================================================
-# SUBPROCESS EXECUTION
-# =============================================================================
-
-def run_command(
-    command: List[str],
-    stage_name: str,
-) -> float:
-    """
-    Run one pipeline stage and return its elapsed runtime.
-
-    Child Python processes are launched using -u so progress output appears
-    immediately in the terminal.
-    """
-
-    separator()
-
-    print(
-        f"[STARTING] {stage_name}"
-    )
-
-    print(
-        f"Started: {timestamp()}"
-    )
-
-    separator()
-
-    print("Command:")
-
-    print(
-        " ".join(
-            (
-                f'"{part}"'
-                if " " in part
-                else part
-            )
-            for part in command
-        )
-    )
-
-    print()
-
-    start = time.perf_counter()
-
-    result = subprocess.run(
-        command
-    )
-
-    elapsed = (
-        time.perf_counter()
-        - start
-    )
-
+def run_command(command: List[str], stage_name: str) -> None:
+    print(f"[STARTING] {stage_name}")
+    print(" ".join(f'"{part}"' if " " in part else part for part in command))
+    result = subprocess.run(command)
     if result.returncode != 0:
+        raise SystemExit(result.returncode)
 
-        separator()
-
-        print(
-            f"[ERROR] {stage_name} failed."
-        )
-
-        print(
-            f"Return code: "
-            f"{result.returncode}"
-        )
-
-        print(
-            f"Elapsed: "
-            f"{format_duration(elapsed)}"
-        )
-
-        print()
-
-        print(
-            "The pipeline has been stopped."
-        )
-
-        raise SystemExit(
-            result.returncode
-        )
-
-    print()
-
-    print(
-        f"[SUCCESS] {stage_name}"
-    )
-
-    print(
-        f"Finished: {timestamp()}"
-    )
-
-    print(
-        f"Elapsed: "
-        f"{format_duration(elapsed)}"
-    )
-
-    return elapsed
-
-
-# =============================================================================
-# STAGE 1 - DATA PREPARATION
-# =============================================================================
 
 def run_data_preparation(
     kinematics_dirs: List[Path],
@@ -641,78 +367,24 @@ def run_data_preparation(
     prepared_data_dir: Path,
     sample_rate: float,
     max_trials: Optional[int],
-) -> Tuple[Path, float]:
-
-    command: List[str] = [
-        PYTHON_EXECUTABLE,
-        "-u",
-        str(DATA_PREP_SCRIPT),
-    ]
-
-    for kin_dir, ann_dir in zip(
-        kinematics_dirs,
-        annotations_dirs,
-    ):
-
-        command.extend(
-            [
-                "--kinematics-dir",
-                str(kin_dir),
-
-                "--annotations-dir",
-                str(ann_dir),
-            ]
-        )
-
-    command.extend(
-        [
-            "--output-dir",
-            str(prepared_data_dir),
-
-            "--sample-rate",
-            str(sample_rate),
-        ]
-    )
-
+) -> Path:
+    command = [PYTHON_EXECUTABLE, "-u", str(DATA_PREP_SCRIPT)]
+    for kinematics_dir, annotations_dir in zip(kinematics_dirs, annotations_dirs):
+        command.extend([
+            "--kinematics-dir", str(kinematics_dir),
+            "--annotations-dir", str(annotations_dir),
+        ])
+    command.extend([
+        "--output-dir", str(prepared_data_dir),
+        "--sample-rate", str(sample_rate),
+    ])
     if max_trials is not None:
+        command.extend(["--max-trials", str(max_trials)])
+    run_command(command, "STAGE 1: PyTorch data preparation")
+    frame_file = prepared_data_dir / "all_frame_level.csv"
+    require_file(frame_file, "combined frame-level dataset")
+    return frame_file
 
-        command.extend(
-            [
-                "--max-trials",
-                str(max_trials),
-            ]
-        )
-
-    elapsed = run_command(
-        command,
-        "STAGE 1: PyTorch data preparation",
-    )
-
-    frame_file = (
-        prepared_data_dir
-        / "all_frame_level.csv"
-    )
-
-    require_file(
-        frame_file,
-        "combined frame-level dataset",
-    )
-
-    print()
-    print(
-        "[FOUND] PyTorch frame-level dataset:"
-    )
-    print(frame_file)
-
-    return (
-        frame_file,
-        elapsed,
-    )
-
-
-# =============================================================================
-# STAGE 2 - PYTORCH TRAINING
-# =============================================================================
 
 def run_pytorch_training(
     frame_file: Path,
@@ -723,102 +395,43 @@ def run_pytorch_training(
     window_seconds: float,
     stride_samples: int,
     batch_size: int,
+    dropout: float,
+    weight_decay: float,
+    early_stopping_patience: int,
+    early_stopping_metric: str,
     device: str,
     standardize: bool,
     save_fold_models: bool,
-) -> Tuple[Path, float]:
-
-    command: List[str] = [
-        PYTHON_EXECUTABLE,
-        "-u",
-        str(TRAIN_SCRIPT),
-
-        "--input-csv",
-        str(frame_file),
-
-        "--output-dir",
-        str(model_dir),
-
-        "--kinematic-source",
-        kinematic_source,
-
-        "--sample-rate",
-        str(sample_rate),
-
-        "--window-seconds",
-        str(window_seconds),
-
-        "--stride-samples",
-        str(stride_samples),
-
-        "--batch-size",
-        str(batch_size),
-
-        "--epochs",
-        str(preset.epochs),
-
-        "--device",
-        device,
+) -> Path:
+    command = [
+        PYTHON_EXECUTABLE, "-u", str(TRAIN_SCRIPT),
+        "--input-csv", str(frame_file),
+        "--output-dir", str(model_dir),
+        "--kinematic-source", kinematic_source,
+        "--sample-rate", str(sample_rate),
+        "--window-seconds", str(window_seconds),
+        "--stride-samples", str(stride_samples),
+        "--batch-size", str(batch_size),
+        "--dropout", str(dropout),
+        "--weight-decay", str(weight_decay),
+        "--early-stopping-patience", str(early_stopping_patience),
+        "--early-stopping-metric", early_stopping_metric,
+        "--epochs", str(preset.epochs),
+        "--device", device,
     ]
-
     if preset.max_folds is not None:
-
-        command.extend(
-            [
-                "--max-folds",
-                str(preset.max_folds),
-            ]
-        )
-
+        command.extend(["--max-folds", str(preset.max_folds)])
     if preset.max_windows is not None:
-
-        command.extend(
-            [
-                "--max-windows",
-                str(preset.max_windows),
-            ]
-        )
-
+        command.extend(["--max-windows", str(preset.max_windows)])
     if standardize:
-        command.append(
-            "--standardize"
-        )
-
+        command.append("--standardize")
     if save_fold_models:
-        command.append(
-            "--save-fold-models"
-        )
+        command.append("--save-fold-models")
+    run_command(command, "STAGE 2: PyTorch Transformer training")
+    model_file = model_dir / "pytorch_gesture_model.pt"
+    require_file(model_file, "trained PyTorch gesture model")
+    return model_file
 
-    elapsed = run_command(
-        command,
-        "STAGE 2: PyTorch Transformer training",
-    )
-
-    model_file = (
-        model_dir
-        / "pytorch_gesture_model.pt"
-    )
-
-    require_file(
-        model_file,
-        "trained PyTorch gesture model",
-    )
-
-    print()
-    print(
-        "[FOUND] PyTorch model:"
-    )
-    print(model_file)
-
-    return (
-        model_file,
-        elapsed,
-    )
-
-
-# =============================================================================
-# STAGE 3 - PYTORCH GESTURE PREDICTION
-# =============================================================================
 
 def run_pytorch_prediction(
     predict_file: Path,
@@ -826,542 +439,78 @@ def run_pytorch_prediction(
     prediction_dir: Path,
     sample_rate: float,
     window_seconds: float,
-) -> Tuple[Path, float]:
-
-    """
-    This assumes predict_gestures.py has been modified to support:
-
-        --model-type pytorch
-
-    and knows how to load:
-
-        pytorch_gesture_model.pt
-    """
-
+) -> None:
     command = [
-        PYTHON_EXECUTABLE,
-        "-u",
-        str(PREDICT_SCRIPT),
-
-        "--kinematics",
-        str(predict_file),
-
-        "--model-dir",
-        str(model_dir),
-
-        "--model-type",
-        "pytorch",
-
-        "--output-dir",
-        str(prediction_dir),
-
-        "--sample-rate",
-        str(sample_rate),
-
-        "--window-seconds",
-        str(window_seconds),
+        PYTHON_EXECUTABLE, "-u", str(PREDICT_SCRIPT),
+        "--kinematics", str(predict_file),
+        "--model-dir", str(model_dir),
+        "--model-type", "pytorch",
+        "--output-dir", str(prediction_dir),
+        "--sample-rate", str(sample_rate),
+        "--window-seconds", str(window_seconds),
     ]
+    run_command(command, "STAGE 3: PyTorch gesture prediction")
 
-    elapsed = run_command(
-        command,
-        "STAGE 3: PyTorch gesture prediction and segmentation",
-    )
-
-    trial_id = (
-        predict_file.stem
-    )
-
-    segment_file = (
-        prediction_dir
-        / (
-            f"{trial_id}"
-            "_predicted_segments.txt"
-        )
-    )
-
-    require_file(
-        segment_file,
-        "predicted gesture transcription",
-    )
-
-    print()
-    print(
-        "[FOUND] Predicted gesture transcription:"
-    )
-    print(segment_file)
-
-    return (
-        segment_file,
-        elapsed,
-    )
-
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 def build_arg_parser() -> argparse.ArgumentParser:
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run ATARI-2 PyTorch Transformer gesture-recognition tests."
-        )
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=[
-            "smoke",
-            "single",
-            "full",
-        ],
-        required=True,
-        help=(
-            "smoke = minimal pipeline test; "
-            "single = full LOUO on one procedure; "
-            "full = full LOUO on all supplied procedures."
-        ),
-    )
-
-    parser.add_argument(
-        "--kinematics-dir",
-        action="append",
-        required=True,
-        help=(
-            "Directory containing raw JIGSAWS kinematic files. "
-            "Supply multiple times for multi-task training."
-        ),
-    )
-
-    parser.add_argument(
-        "--annotations-dir",
-        action="append",
-        required=True,
-        help=(
-            "Directory containing matching gesture transcription files. "
-            "Supply multiple times for multi-task training."
-        ),
-    )
-
-    parser.add_argument(
-        "--predict-file",
-        type=str,
-        required=False,
-        help=(
-            "Raw kinematic file on which the final model should "
-            "generate gesture predictions."
-        ),
-    )
-
-    parser.add_argument(
-        "--output-root",
-        type=str,
-        default=str(
-            PROJECT_ROOT
-            / "outputs_pytorch"
-        ),
-    )
-
-    parser.add_argument(
-        "--kinematic-source",
-        choices=[
-            "mtm",
-            "psm",
-        ],
-        default="mtm",
-        help=(
-            "38-dimensional robot stream used by the Transformer. "
-            "Default is MTM."
-        ),
-    )
-
-    parser.add_argument(
-        "--sample-rate",
-        type=float,
-        default=30.0,
-    )
-
-    parser.add_argument(
-        "--window-seconds",
-        type=float,
-        default=1.0,
-    )
-
-    parser.add_argument(
-        "--stride-samples",
-        type=int,
-        default=1,
-        help=(
-            "Transformer sliding-window stride in raw frames. "
-            "Paper-style default is 1."
-        ),
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=64,
-    )
-
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help=(
-            "auto, cpu, cuda, cuda:0, mps, etc."
-        ),
-    )
-
-    parser.add_argument(
-        "--standardize",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--save-fold-models",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--skip-prediction",
-        action="store_true",
-        help=(
-            "Run preprocessing and training only. "
-            "Useful until predict_gestures.py supports PyTorch."
-        ),
-    )
-
-    parser.add_argument(
-        "--reuse-prepared-data",
-        action="store_true",
-        help=(
-            "Skip data_prep.py and reuse an existing "
-            "all_frame_level.csv under the selected output root."
-        ),
-    )
-
+    parser = argparse.ArgumentParser(description="Run the ATARI-2 PyTorch pipeline.")
+    parser.add_argument("--mode", choices=["smoke", "single", "full"], required=True)
+    parser.add_argument("--kinematics-dir", action="append", required=True)
+    parser.add_argument("--annotations-dir", action="append", required=True)
+    parser.add_argument("--predict-file")
+    parser.add_argument("--output-root", default=str(PROJECT_ROOT / "outputs_pytorch"))
+    parser.add_argument("--kinematic-source", choices=["mtm", "psm"], default="mtm")
+    parser.add_argument("--sample-rate", type=float, default=30.0)
+    parser.add_argument("--window-seconds", type=float, default=1.0)
+    parser.add_argument("--stride-samples", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--early-stopping-metric", choices=["macro_f1", "accuracy"], default="macro_f1")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--standardize", action="store_true")
+    parser.add_argument("--save-fold-models", action="store_true")
+    parser.add_argument("--skip-prediction", action="store_true")
+    parser.add_argument("--reuse-prepared-data", action="store_true")
     return parser
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
-
 def main() -> None:
-
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
-    preset = PRESETS[
-        args.mode
-    ]
-
-    # -------------------------------------------------------------------------
-    # Convert paths
-    # -------------------------------------------------------------------------
-
-    kinematics_dirs = [
-        Path(path).resolve()
-        for path in args.kinematics_dir
-    ]
-
-    annotations_dirs = [
-        Path(path).resolve()
-        for path in args.annotations_dir
-    ]
-
-    if (
-        len(kinematics_dirs)
-        != len(annotations_dirs)
-    ):
-        raise ValueError(
-            "The number of --kinematics-dir values must "
-            "equal the number of --annotations-dir values."
-        )
-
-    predict_file: Optional[Path]
-
-    if args.predict_file is not None:
-        predict_file = Path(
-            args.predict_file
-        ).resolve()
-    else:
-        predict_file = None
-
-    output_root = Path(
-        args.output_root
-    ).resolve()
-
-    prepared_data_dir = (
-        output_root
-        / "prepared_data"
-    )
-
-    model_dir = (
-        output_root
-        / "pytorch_model"
-    )
-
-    prediction_dir = (
-        output_root
-        / "predictions"
-    )
-
-    # -------------------------------------------------------------------------
-    # Validate scripts
-    # -------------------------------------------------------------------------
-
-    require_script(
-        DATA_PREP_SCRIPT
-    )
-
-    require_script(
-        TRAIN_SCRIPT
-    )
-
-    if not args.skip_prediction:
-        require_script(
-            PREDICT_SCRIPT
-        )
-
-    # -------------------------------------------------------------------------
-    # Validate input folders
-    # -------------------------------------------------------------------------
-
+    args = build_arg_parser().parse_args()
+    preset = PRESETS[args.mode]
+    kinematics_dirs = [Path(path).resolve() for path in args.kinematics_dir]
+    annotations_dirs = [Path(path).resolve() for path in args.annotations_dir]
+    if len(kinematics_dirs) != len(annotations_dirs):
+        raise ValueError("The number of kinematics and annotation directories must match.")
+    if args.mode == "single" and len(kinematics_dirs) != 1:
+        raise ValueError("--mode single expects exactly one directory pair.")
     for path in kinematics_dirs:
-        require_directory(
-            path,
-            "kinematic data directory",
-        )
-
+        require_directory(path, "kinematic data directory")
     for path in annotations_dirs:
-        require_directory(
-            path,
-            "gesture annotation directory",
-        )
+        require_directory(path, "annotation directory")
+    require_script(DATA_PREP_SCRIPT)
+    require_script(TRAIN_SCRIPT)
 
-    if not args.skip_prediction:
-
-        if predict_file is None:
-            raise ValueError(
-                "--predict-file is required unless "
-                "--skip-prediction is supplied."
-            )
-
-        require_file(
-            predict_file,
-            "prediction kinematic file",
-        )
-
-    # -------------------------------------------------------------------------
-    # Validate mode semantics
-    # -------------------------------------------------------------------------
-
-    if (
-        args.mode == "single"
-        and len(kinematics_dirs) != 1
-    ):
-        raise ValueError(
-            "--mode single expects exactly one "
-            "kinematics/annotation directory pair."
-        )
-
-    # -------------------------------------------------------------------------
-    # Create outputs
-    # -------------------------------------------------------------------------
-
-    prepared_data_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    model_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    prediction_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # -------------------------------------------------------------------------
-    # Print configuration
-    # -------------------------------------------------------------------------
-
-    separator()
-
-    print(
-        "ATARI-2 PYTORCH GESTURE RECOGNITION PIPELINE"
-    )
-
-    separator()
-
-    print(
-        f"Mode: {preset.name}"
-    )
-
-    print(
-        f"Description: {preset.description}"
-    )
-
-    print()
-
-    print(
-        f"Python: {PYTHON_EXECUTABLE}"
-    )
-
-    print(
-        f"Project root: {PROJECT_ROOT}"
-    )
-
-    print()
-
-    print(
-        f"Kinematic source: "
-        f"{args.kinematic_source.upper()}"
-    )
-
-    print(
-        f"Device request: {args.device}"
-    )
-
-    print()
-
-    print(
-        "Training kinematic directories:"
-    )
-
-    for index, path in enumerate(
-        kinematics_dirs,
-        start=1,
-    ):
-        print(
-            f"  {index}. {path}"
-        )
-
-    print()
-
-    print(
-        "Annotation directories:"
-    )
-
-    for index, path in enumerate(
-        annotations_dirs,
-        start=1,
-    ):
-        print(
-            f"  {index}. {path}"
-        )
-
-    if predict_file is not None:
-        print()
-        print(
-            f"Prediction file: "
-            f"{predict_file}"
-        )
-
-    print()
-
-    print(
-        "Test settings:"
-    )
-
-    print(
-        f"  Epochs: {preset.epochs}"
-    )
-
-    print(
-        f"  Max trials per dataset: "
-        f"{preset.max_trials}"
-    )
-
-    print(
-        f"  Max LOUO folds: "
-        f"{preset.max_folds}"
-    )
-
-    print(
-        f"  Max windows: "
-        f"{preset.max_windows}"
-    )
-
-    print(
-        f"  Batch size: "
-        f"{args.batch_size}"
-    )
-
-    print(
-        f"  Window: "
-        f"{args.window_seconds} sec"
-    )
-
-    print(
-        f"  Sequence stride: "
-        f"{args.stride_samples} frame(s)"
-    )
-
-    print()
-
-    print(
-        f"Output root: "
-        f"{output_root}"
-    )
-
-    # -------------------------------------------------------------------------
-    # Pipeline timer
-    # -------------------------------------------------------------------------
-
-    pipeline_start = (
-        time.perf_counter()
-    )
-
-    stage1_elapsed = 0.0
-    stage2_elapsed = 0.0
-    stage3_elapsed = 0.0
-
-    # -------------------------------------------------------------------------
-    # STAGE 1
-    # -------------------------------------------------------------------------
-
-    frame_file = (
-        prepared_data_dir
-        / "all_frame_level.csv"
-    )
+    output_root = Path(args.output_root).resolve()
+    prepared_data_dir = output_root / "prepared_data"
+    model_dir = output_root / "pytorch_model"
+    prediction_dir = output_root / "predictions"
+    output_root.mkdir(parents=True, exist_ok=True)
+    prepared_data_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    prediction_dir.mkdir(parents=True, exist_ok=True)
 
     if args.reuse_prepared_data:
-
-        print()
-        print(
-            "[SKIP] Reusing existing prepared frame-level data."
-        )
-
-        require_file(
-            frame_file,
-            "existing all_frame_level.csv",
-        )
-
+        frame_file = prepared_data_dir / "all_frame_level.csv"
+        require_file(frame_file, "existing frame-level dataset")
     else:
-
-        (
-            frame_file,
-            stage1_elapsed,
-        ) = run_data_preparation(
-            kinematics_dirs=kinematics_dirs,
-            annotations_dirs=annotations_dirs,
-            prepared_data_dir=prepared_data_dir,
-            sample_rate=args.sample_rate,
-            max_trials=preset.max_trials,
+        frame_file = run_data_preparation(
+            kinematics_dirs, annotations_dirs, prepared_data_dir,
+            args.sample_rate, preset.max_trials,
         )
 
-    # -------------------------------------------------------------------------
-    # STAGE 2
-    # -------------------------------------------------------------------------
-
-    (
-        model_file,
-        stage2_elapsed,
-    ) = run_pytorch_training(
+    model_file = run_pytorch_training(
         frame_file=frame_file,
         model_dir=model_dir,
         preset=preset,
@@ -1370,119 +519,28 @@ def main() -> None:
         window_seconds=args.window_seconds,
         stride_samples=args.stride_samples,
         batch_size=args.batch_size,
+        dropout=args.dropout,
+        weight_decay=args.weight_decay,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_metric=args.early_stopping_metric,
         device=args.device,
         standardize=args.standardize,
         save_fold_models=args.save_fold_models,
     )
 
-    # -------------------------------------------------------------------------
-    # STAGE 3
-    # -------------------------------------------------------------------------
-
-    segment_file: Optional[Path] = None
-
     if args.skip_prediction:
-
-        print()
-        print(
-            "[SKIP] Stage 3 prediction skipped."
-        )
-
-    else:
-
-        assert predict_file is not None
-
-        (
-            segment_file,
-            stage3_elapsed,
-        ) = run_pytorch_prediction(
-            predict_file=predict_file,
-            model_dir=model_dir,
-            prediction_dir=prediction_dir,
-            sample_rate=args.sample_rate,
-            window_seconds=args.window_seconds,
-        )
-
-    # -------------------------------------------------------------------------
-    # COMPLETE
-    # -------------------------------------------------------------------------
-
-    total_elapsed = (
-        time.perf_counter()
-        - pipeline_start
+        print("[SKIP] Stage 3 prediction skipped.")
+        return
+    if args.predict_file is None:
+        raise ValueError("--predict-file is required unless --skip-prediction is supplied.")
+    predict_file = Path(args.predict_file).resolve()
+    require_file(predict_file, "prediction kinematic file")
+    require_script(PREDICT_SCRIPT)
+    run_pytorch_prediction(
+        predict_file, model_dir, prediction_dir,
+        args.sample_rate, args.window_seconds,
     )
-
-    separator()
-
-    print(
-        "[COMPLETE] ATARI-2 PyTorch pipeline finished."
-    )
-
-    separator()
-
-    print(
-        "Runtime summary:"
-    )
-
-    print(
-        "Stage 1 - Data preparation:       "
-        f"{format_duration(stage1_elapsed)}"
-    )
-
-    print(
-        "Stage 2 - PyTorch training:       "
-        f"{format_duration(stage2_elapsed)}"
-    )
-
-    if args.skip_prediction:
-
-        print(
-            "Stage 3 - Gesture prediction:   SKIPPED"
-        )
-
-    else:
-
-        print(
-            "Stage 3 - Gesture prediction:   "
-            f"{format_duration(stage3_elapsed)}"
-        )
-
-    print(
-        "Total pipeline runtime:           "
-        f"{format_duration(total_elapsed)}"
-    )
-
-    print()
-
-    print(
-        "Frame-level training data:"
-    )
-    print(
-        frame_file
-    )
-
-    print()
-
-    print(
-        "Final PyTorch model:"
-    )
-    print(
-        model_file
-    )
-
-    if segment_file is not None:
-
-        print()
-
-        print(
-            "Predicted gesture transcription:"
-        )
-
-        print(
-            segment_file
-        )
-
-    separator()
+    print(f"Final PyTorch model: {model_file}")
 
 
 if __name__ == "__main__":

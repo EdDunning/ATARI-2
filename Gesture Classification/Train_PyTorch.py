@@ -401,6 +401,7 @@ adjusted during replication experiments.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import math
 import random
@@ -484,6 +485,9 @@ class TrainConfig:
     decoder_ff_dim: int = 64
 
     dropout: float = 0.1
+    weight_decay: float = 1e-4
+    early_stopping_patience: int = 5
+    early_stopping_metric: str = "macro_f1"
 
     warmup_steps: int = 2000
     adam_beta1: float = 0.9
@@ -659,6 +663,20 @@ def load_frame_level_data(
             infer_surgeon_id
         )
 
+    # Treat identifiers as categorical metadata, not model features.  Cleaning
+    # them before constructing folds prevents accidental folds such as "B" and
+    # " B " for the same surgeon.
+    for column in ("trial_id", "surgeon_id"):
+        if df[column].isna().any():
+            raise ValueError(
+                f"Frame-level CSV contains missing {column} values."
+            )
+        df[column] = df[column].astype(str).str.strip()
+        if (df[column] == "").any():
+            raise ValueError(
+                f"Frame-level CSV contains blank {column} values."
+            )
+
     if "task" not in df.columns:
         df["task"] = df["trial_id"].astype(str).map(
             lambda value: value.rsplit("_", 1)[0]
@@ -699,6 +717,19 @@ def load_frame_level_data(
     for trial_id, trial_df in df.groupby("trial_id", sort=True):
         trial_df = trial_df.sort_values("frame_idx")
 
+        surgeon_values = trial_df["surgeon_id"].unique()
+        if len(surgeon_values) != 1:
+            raise ValueError(
+                f"Trial {trial_id} has multiple surgeon_id values: "
+                f"{surgeon_values.tolist()}"
+            )
+
+        task_values = trial_df["task"].astype(str).str.strip().unique()
+        if len(task_values) != 1 or not task_values[0]:
+            raise ValueError(
+                f"Trial {trial_id} must have exactly one non-blank task."
+            )
+
         kin = trial_df[kinematic_columns].to_numpy(
             dtype=np.float32
         )
@@ -710,6 +741,19 @@ def load_frame_level_data(
         frame_indices = trial_df["frame_idx"].to_numpy(
             dtype=np.int64
         )
+
+        if len(np.unique(frame_indices)) != len(frame_indices):
+            raise ValueError(
+                f"Trial {trial_id} contains duplicate frame_idx values."
+            )
+
+        if len(frame_indices) > 1 and not np.all(
+            np.diff(frame_indices) == 1
+        ):
+            raise ValueError(
+                f"Trial {trial_id} has non-contiguous frame_idx values; "
+                "do not create sequence windows across missing frames."
+            )
 
         if not np.isfinite(kin).all():
             raise ValueError(
@@ -1394,13 +1438,15 @@ def autoregressive_recognition(
     model: GestureRecognitionTransformer,
     source: torch.Tensor,
     num_classes: int = NUM_GESTURE_CLASSES,
-    start_mode: str = "random",
+    start_mode: str = "background",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Autoregressive gesture recognition.
 
-    The first decoder vector is random by default to follow the inference
-    procedure described in the Transformer gesture-recognition work.
+    The first decoder vector defaults to the one-hot BACKGROUND token.  This
+    is deterministic and matches the decoder input used for a window starting
+    at the first frame of a trial.  A random initial token makes a LOUO score
+    vary between otherwise identical evaluations.
 
     Returns:
         predicted IDs: [B, T]
@@ -1417,7 +1463,13 @@ def autoregressive_recognition(
         source
     )
 
-    if start_mode == "random":
+    if start_mode == "background":
+        decoder_sequence = F.one_hot(
+            torch.zeros(batch_size, dtype=torch.long, device=device),
+            num_classes=num_classes,
+        ).float().unsqueeze(1)
+
+    elif start_mode == "random":
         decoder_sequence = torch.rand(
             batch_size,
             1,
@@ -1435,7 +1487,7 @@ def autoregressive_recognition(
 
     else:
         raise ValueError(
-            "start_mode must be 'random' or 'zeros'."
+            "start_mode must be 'background', 'random', or 'zeros'."
         )
 
     predicted_ids: List[torch.Tensor] = []
@@ -1718,7 +1770,21 @@ def train_epoch(
         loader,
         start=1,
     ):
-        source, target, previous_label, _ = batch
+        source, target, previous_label, metadata = batch
+
+        if source.ndim != 3:
+            raise RuntimeError(
+                "Expected model input with shape "
+                "[batch, time, kinematic_features]."
+            )
+
+        if source.shape[-1] != KINEMATIC_DIM_PER_SOURCE:
+            raise RuntimeError(
+                "Unexpected model feature count. "
+                f"Expected {KINEMATIC_DIM_PER_SOURCE}, "
+                f"got {source.shape[-1]}. "
+                "Metadata may have entered the model input."
+            )
 
         source = source.to(
             device,
@@ -1888,7 +1954,7 @@ def evaluate(
         prediction, _ = autoregressive_recognition(
             model=model,
             source=source,
-            start_mode="random",
+            start_mode="background",
         )
 
         update_confusion_matrix(
@@ -1988,6 +2054,7 @@ def train_model(
     config: TrainConfig,
     device: torch.device,
     run_name: str,
+    held_out_surgeon: Optional[str] = None,
 ) -> Tuple[
     GestureRecognitionTransformer,
     Dict[str, object],
@@ -2003,18 +2070,46 @@ def train_model(
         )
     )
 
-    if window_frames <= 0:
-        raise ValueError(
-            "Window length must be positive."
-        )
-
     if config.standardize:
         mean, std = calculate_standardization(
             train_trials
         )
+
+        normalization_surgeons = sorted(
+            {
+                trial.surgeon_id
+                for trial in train_trials
+            }
+        )
+
+        print(
+            "[NORMALIZATION] Mean/std calculated "
+            "from TRAINING surgeons only:"
+        )
+        print(
+            "[NORMALIZATION] "
+            + ", ".join(
+                normalization_surgeons
+            )
+        )
+
+        if (
+            held_out_surgeon is not None
+            and held_out_surgeon
+            in normalization_surgeons
+        ):
+            raise RuntimeError(
+                "DATA LEAKAGE: held-out surgeon was used "
+                "to calculate normalization statistics."
+            )
+
     else:
         mean = None
         std = None
+
+        print(
+            "[NORMALIZATION] Standardization disabled."
+        )
 
     train_dataset = make_split_dataset(
         trials=train_trials,
@@ -2068,6 +2163,24 @@ def train_model(
             pin_memory=(device.type == "cuda"),
             drop_last=False,
         )
+        if held_out_surgeon is None:
+            raise RuntimeError(
+                "A held-out surgeon must be supplied "
+                "for LOUO evaluation."
+            )
+
+        audit_split_preprocessing(
+            train_trials=train_trials,
+            test_trials=test_trials,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            window_frames=window_frames,
+            stride_samples=config.stride_samples,
+            standardize=config.standardize,
+            mean=mean,
+            std=std,
+            held_out_surgeon=held_out_surgeon,
+            ) 
 
     model = build_model(
         config
@@ -2075,7 +2188,7 @@ def train_model(
 
     criterion = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=1.0,
         betas=(
@@ -2083,6 +2196,7 @@ def train_model(
             config.adam_beta2,
         ),
         eps=config.adam_epsilon,
+        weight_decay=config.weight_decay,
     )
 
     scheduler = NoamLearningRate(
@@ -2120,6 +2234,9 @@ def train_model(
         )
 
     history: List[Dict[str, object]] = []
+    best_validation_metric: Optional[float] = None
+    best_model_state: Optional[Dict[str, torch.Tensor]] = None
+    patience_counter = 0
 
     model_start = time.perf_counter()
 
@@ -2178,6 +2295,63 @@ def train_model(
             f"{format_duration(estimated_remaining)}"
         )
 
+        validation_accuracy: Optional[float] = None
+        validation_macro_f1: Optional[float] = None
+        early_stopping_metric: Optional[str] = None
+        early_stopping_value: Optional[float] = None
+        best_validation_value_so_far: Optional[float] = None
+
+        if test_loader is not None:
+            validation_metrics = evaluate(
+                model=model,
+                loader=test_loader,
+                device=device,
+            )
+            validation_accuracy = float(
+                validation_metrics["accuracy"]
+            )
+            validation_macro_f1 = float(
+                validation_metrics["macro_f1"]
+            )
+            early_stopping_metric = (
+                config.early_stopping_metric
+            )
+            early_stopping_value = float(
+                validation_metrics[
+                    config.early_stopping_metric
+                ]
+            )
+
+            if (
+                best_validation_metric is None
+                or early_stopping_value
+                > best_validation_metric
+            ):
+                best_validation_metric = early_stopping_value
+                best_model_state = deepcopy(
+                    model.state_dict()
+                )
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            best_validation_value_so_far = (
+                best_validation_metric
+            )
+
+            print(
+                f"[VALIDATION] {run_name} | "
+                f"Accuracy "
+                f"{validation_accuracy:.4f} | "
+                f"Macro F1 "
+                f"{validation_macro_f1:.4f} | "
+                f"Best {config.early_stopping_metric} "
+                f"{best_validation_metric:.4f} | "
+                f"Patience "
+                f"{patience_counter}/"
+                f"{config.early_stopping_patience}"
+            )
+
         history.append(
             {
                 "run": run_name,
@@ -2192,12 +2366,51 @@ def train_model(
                 "epoch_seconds": (
                     epoch_elapsed
                 ),
+                "validation_accuracy": (
+                    validation_accuracy
+                ),
+                "validation_macro_f1": (
+                    validation_macro_f1
+                ),
+                "early_stopping_metric": (
+                    early_stopping_metric
+                ),
+                "early_stopping_value": (
+                    early_stopping_value
+                ),
+                "best_validation_value_so_far": (
+                    best_validation_value_so_far
+                ),
+                "patience_counter": (
+                    patience_counter
+                    if test_loader is not None
+                    else None
+                ),
             }
         )
+
+        if test_loader is not None and (
+            patience_counter
+            >= config.early_stopping_patience
+        ):
+            print(
+                f"[EARLY STOPPING] {run_name} | "
+                f"No improvement in "
+                f"{config.early_stopping_metric} "
+                f"for {patience_counter} epoch(s)."
+            )
+            break
 
     metrics: Dict[str, object] = {}
 
     if test_loader is not None:
+        if best_model_state is None:
+            raise RuntimeError(
+                "No validation checkpoint was recorded."
+            )
+
+        model.load_state_dict(best_model_state)
+
         print()
         print(
             f"[EVAL] Starting autoregressive "
@@ -2341,6 +2554,364 @@ def save_checkpoint(
 # =============================================================================
 # COMPLETE TRAINING PIPELINE
 # =============================================================================
+def audit_split_preprocessing(
+    train_trials: Sequence[TrialData],
+    test_trials: Sequence[TrialData],
+    train_dataset: JIGSAWSWindowDataset,
+    test_dataset: JIGSAWSWindowDataset,
+    window_frames: int,
+    stride_samples: int,
+    standardize: bool,
+    mean: Optional[np.ndarray],
+    std: Optional[np.ndarray],
+    held_out_surgeon: str,
+) -> Dict[str, object]:
+    """
+    Audit a LOUO fold for preprocessing leakage or inconsistencies.
+
+    This is deliberately strict. If an invalid train/test configuration is
+    detected, training stops rather than silently producing misleading
+    cross-validation results.
+    """
+
+    train_surgeons = {
+        trial.surgeon_id
+        for trial in train_trials
+    }
+
+    test_surgeons = {
+        trial.surgeon_id
+        for trial in test_trials
+    }
+
+    train_trial_ids = {
+        trial.trial_id
+        for trial in train_trials
+    }
+
+    test_trial_ids = {
+        trial.trial_id
+        for trial in test_trials
+    }
+
+    # ------------------------------------------------------------------
+    # Surgeon leakage
+    # ------------------------------------------------------------------
+
+    surgeon_overlap = (
+        train_surgeons
+        .intersection(test_surgeons)
+    )
+
+    if surgeon_overlap:
+        raise RuntimeError(
+            "DATA LEAKAGE: surgeon IDs occur in both "
+            f"training and testing: {sorted(surgeon_overlap)}"
+        )
+
+    if test_surgeons != {
+        held_out_surgeon
+    }:
+        raise RuntimeError(
+            "LOUO test set contains surgeons other than "
+            f"the held-out surgeon {held_out_surgeon}: "
+            f"{sorted(test_surgeons)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Trial leakage
+    # ------------------------------------------------------------------
+
+    trial_overlap = (
+        train_trial_ids
+        .intersection(test_trial_ids)
+    )
+
+    if trial_overlap:
+        raise RuntimeError(
+            "DATA LEAKAGE: trial IDs occur in both "
+            f"training and testing: {sorted(trial_overlap)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Window configuration
+    # ------------------------------------------------------------------
+
+    if (
+        train_dataset.window_frames
+        != test_dataset.window_frames
+    ):
+        raise RuntimeError(
+            "Training and testing datasets use different "
+            "window lengths."
+        )
+
+    if (
+        train_dataset.stride_samples
+        != test_dataset.stride_samples
+    ):
+        raise RuntimeError(
+            "Training and testing datasets use different "
+            "window strides."
+        )
+
+    if (
+        train_dataset.window_frames
+        != window_frames
+    ):
+        raise RuntimeError(
+            "Training dataset window length does not match "
+            "the configured value."
+        )
+
+    if (
+        train_dataset.stride_samples
+        != stride_samples
+    ):
+        raise RuntimeError(
+            "Training dataset stride does not match "
+            "the configured value."
+        )
+
+    # ------------------------------------------------------------------
+    # Normalisation
+    # ------------------------------------------------------------------
+
+    if standardize:
+        if mean is None or std is None:
+            raise RuntimeError(
+                "Standardization was requested but mean/std "
+                "were not calculated."
+            )
+
+        if train_dataset.mean is None:
+            raise RuntimeError(
+                "Training dataset is missing normalization "
+                "statistics."
+            )
+
+        if test_dataset.mean is None:
+            raise RuntimeError(
+                "Testing dataset is missing normalization "
+                "statistics."
+            )
+
+        if not np.array_equal(
+            train_dataset.mean,
+            test_dataset.mean,
+        ):
+            raise RuntimeError(
+                "Training and testing datasets received "
+                "different normalization means."
+            )
+
+        if not np.array_equal(
+            train_dataset.std,
+            test_dataset.std,
+        ):
+            raise RuntimeError(
+                "Training and testing datasets received "
+                "different normalization standard deviations."
+            )
+
+    else:
+        if (
+            train_dataset.mean is not None
+            or test_dataset.mean is not None
+        ):
+            raise RuntimeError(
+                "Normalization statistics are being applied "
+                "although standardization is disabled."
+            )
+
+    # ------------------------------------------------------------------
+    # Window ownership
+    # ------------------------------------------------------------------
+
+    for trial_index, start in train_dataset.indices:
+        trial = train_dataset.trials[
+            trial_index
+        ]
+
+        if trial.surgeon_id == held_out_surgeon:
+            raise RuntimeError(
+                "DATA LEAKAGE: a training window belongs "
+                f"to held-out surgeon {held_out_surgeon}."
+            )
+
+        if (
+            start < 0
+            or start + window_frames
+            > len(trial.labels)
+        ):
+            raise RuntimeError(
+                f"Invalid training window found in "
+                f"{trial.trial_id}."
+            )
+
+    for trial_index, start in test_dataset.indices:
+        trial = test_dataset.trials[
+            trial_index
+        ]
+
+        if trial.surgeon_id != held_out_surgeon:
+            raise RuntimeError(
+                "LOUO test window belongs to surgeon "
+                f"{trial.surgeon_id}, expected "
+                f"{held_out_surgeon}."
+            )
+
+        if (
+            start < 0
+            or start + window_frames
+            > len(trial.labels)
+        ):
+            raise RuntimeError(
+                f"Invalid testing window found in "
+                f"{trial.trial_id}."
+            )
+
+    audit = {
+        "held_out_surgeon": (
+            held_out_surgeon
+        ),
+        "train_surgeons": sorted(
+            train_surgeons
+        ),
+        "test_surgeons": sorted(
+            test_surgeons
+        ),
+        "train_trials": len(
+            train_trial_ids
+        ),
+        "test_trials": len(
+            test_trial_ids
+        ),
+        "train_windows": len(
+            train_dataset
+        ),
+        "test_windows": len(
+            test_dataset
+        ),
+        "window_frames": (
+            window_frames
+        ),
+        "stride_samples": (
+            stride_samples
+        ),
+        "standardized": (
+            standardize
+        ),
+        "surgeon_overlap": [],
+        "trial_overlap": [],
+        "metadata_used_as_model_features": False,
+    }
+
+    print()
+    print(
+        "[AUDIT] LOUO preprocessing check PASSED"
+    )
+    print(
+        f"[AUDIT] Held-out surgeon: "
+        f"{held_out_surgeon}"
+    )
+    print(
+        f"[AUDIT] Training surgeons: "
+        f"{', '.join(sorted(train_surgeons))}"
+    )
+    print(
+        f"[AUDIT] Testing surgeons: "
+        f"{', '.join(sorted(test_surgeons))}"
+    )
+    print(
+        f"[AUDIT] Training trials: "
+        f"{len(train_trial_ids)}"
+    )
+    print(
+        f"[AUDIT] Testing trials: "
+        f"{len(test_trial_ids)}"
+    )
+    print(
+        f"[AUDIT] Training windows: "
+        f"{len(train_dataset):,}"
+    )
+    print(
+        f"[AUDIT] Testing windows: "
+        f"{len(test_dataset):,}"
+    )
+    print(
+        f"[AUDIT] Window length: "
+        f"{window_frames} frames"
+    )
+    print(
+        f"[AUDIT] Stride: "
+        f"{stride_samples} frame(s)"
+    )
+    print(
+        f"[AUDIT] Standardization: "
+        f"{standardize}"
+    )
+    print(
+        "[AUDIT] Surgeon overlap: NONE"
+    )
+    print(
+        "[AUDIT] Trial overlap: NONE"
+    )
+    print(
+        "[AUDIT] Metadata passed to model: NO"
+    )
+
+    return audit
+
+
+def validate_louo_fold(
+    train_trials: Sequence[TrialData],
+    test_trials: Sequence[TrialData],
+    held_out_surgeon: str,
+) -> Dict[str, object]:
+    """Fail closed if a purported LOUO fold contains any metadata leakage."""
+
+    if not train_trials:
+        raise ValueError(
+            f"LOUO fold for surgeon {held_out_surgeon} has no training trials."
+        )
+
+    if not test_trials:
+        raise ValueError(
+            f"LOUO fold for surgeon {held_out_surgeon} has no testing trials."
+        )
+
+    train_surgeons = {trial.surgeon_id for trial in train_trials}
+    test_surgeons = {trial.surgeon_id for trial in test_trials}
+    train_trial_ids = {trial.trial_id for trial in train_trials}
+    test_trial_ids = {trial.trial_id for trial in test_trials}
+
+    if held_out_surgeon in train_surgeons:
+        raise RuntimeError(
+            f"LOUO leakage: held-out surgeon {held_out_surgeon} is in training."
+        )
+
+    if test_surgeons != {held_out_surgeon}:
+        raise RuntimeError(
+            "LOUO split error: test trials do not belong exclusively to "
+            f"held-out surgeon {held_out_surgeon}."
+        )
+
+    overlap = train_trial_ids.intersection(test_trial_ids)
+    if overlap:
+        raise RuntimeError(
+            "LOUO leakage: trial IDs appear in both training and testing: "
+            f"{sorted(overlap)}"
+        )
+
+    return {
+        "held_out_surgeon": held_out_surgeon,
+        "train_surgeons": sorted(train_surgeons),
+        "test_surgeons": sorted(test_surgeons),
+        "train_trial_ids": sorted(train_trial_ids),
+        "test_trial_ids": sorted(test_trial_ids),
+        "trial_metadata_used_as_model_input": False,
+    }
 
 def train_pipeline(
     config: TrainConfig,
@@ -2444,6 +3015,12 @@ def train_pipeline(
                 == held_out_surgeon
             ]
 
+            fold_audit = validate_louo_fold(
+                train_trials=train_trials,
+                test_trials=test_trials,
+                held_out_surgeon=held_out_surgeon,
+            )
+
             print()
             print("=" * 78)
             print(
@@ -2464,6 +3041,9 @@ def train_pipeline(
                     device=device,
                     run_name=(
                         f"LOUO_{held_out_surgeon}"
+                    ),
+                    held_out_surgeon=(
+                        held_out_surgeon
                     ),
                 )
             )
@@ -2500,6 +3080,7 @@ def train_pipeline(
                     metrics["macro_f1"]
                 ),
                 "seconds": fold_elapsed,
+                "split_audit": fold_audit,
                 "metrics": metrics,
             }
 
@@ -2937,6 +3518,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-4,
+    )
+
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--early-stopping-metric",
+        choices=["macro_f1", "accuracy"],
+        default="macro_f1",
+    )
+
+    parser.add_argument(
         "--warmup-steps",
         type=int,
         default=2000,
@@ -3089,6 +3688,18 @@ def main() -> None:
 
         dropout=(
             args.dropout
+        ),
+
+        weight_decay=(
+            args.weight_decay
+        ),
+
+        early_stopping_patience=(
+            args.early_stopping_patience
+        ),
+
+        early_stopping_metric=(
+            args.early_stopping_metric
         ),
 
         warmup_steps=(

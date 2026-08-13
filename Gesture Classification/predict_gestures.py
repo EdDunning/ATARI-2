@@ -458,7 +458,12 @@ def _autoregressive_predict_batch(model: GestureRecognitionTransformer, source_b
 
     memory = model.encode(source_batch)
 
-    decoder_sequence = torch.zeros(batch_size, 1, NUM_GESTURE_CLASSES, device=device)
+    # Match Train_PyTorch.py evaluation: begin each independently decoded
+    # window with the same one-hot BACKGROUND token used at trial starts.
+    decoder_sequence = F.one_hot(
+        torch.zeros(batch_size, dtype=torch.long, device=device),
+        num_classes=NUM_GESTURE_CLASSES,
+    ).float().unsqueeze(1)
 
     predicted_ids: List[torch.Tensor] = []
     predicted_confidences: List[torch.Tensor] = []
