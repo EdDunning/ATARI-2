@@ -2018,6 +2018,92 @@ def evaluate(
     return metrics
 
 
+@torch.no_grad()
+def evaluate_teacher_forced(
+    model: GestureRecognitionTransformer,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, object]:
+
+    model.eval()
+
+    confusion = np.zeros(
+        (
+            NUM_GESTURE_CLASSES,
+            NUM_GESTURE_CLASSES,
+        ),
+        dtype=np.int64,
+    )
+
+    window_accuracy_sum = 0.0
+    window_count = 0
+
+    for batch in loader:
+        source, target, previous_label, _ = batch
+
+        source = source.to(
+            device,
+            non_blocking=True,
+        )
+
+        target = target.to(
+            device,
+            non_blocking=True,
+        )
+
+        previous_label = previous_label.to(
+            device,
+            non_blocking=True,
+        )
+
+        decoder_input = make_teacher_forcing_input(
+            target=target,
+            previous_label=previous_label,
+        )
+
+        logits = model(
+            source,
+            decoder_input,
+        )
+
+        prediction = torch.argmax(
+            logits,
+            dim=-1,
+        )
+
+        update_confusion_matrix(
+            confusion,
+            target,
+            prediction,
+        )
+
+        per_window_accuracy = (
+            (prediction == target)
+            .float()
+            .mean(dim=1)
+        )
+
+        window_accuracy_sum += float(
+            per_window_accuracy.sum().item()
+        )
+
+        window_count += int(
+            len(per_window_accuracy)
+        )
+
+    metrics = metrics_from_confusion_matrix(
+        confusion
+    )
+
+    metrics["mean_window_accuracy"] = (
+        window_accuracy_sum / window_count
+        if window_count
+        else 0.0
+    )
+
+    return metrics
+
+
 # =============================================================================
 # DATASET CREATION FOR A SPLIT
 # =============================================================================
@@ -2295,29 +2381,54 @@ def train_model(
             f"{format_duration(estimated_remaining)}"
         )
 
-        validation_accuracy: Optional[float] = None
-        validation_macro_f1: Optional[float] = None
+        validation_teacher_forced_accuracy: Optional[float] = None
+        validation_teacher_forced_macro_f1: Optional[float] = None
+        validation_teacher_forced_confusion_matrix: Optional[str] = None
+        validation_autoregressive_accuracy: Optional[float] = None
+        validation_autoregressive_macro_f1: Optional[float] = None
+        validation_autoregressive_confusion_matrix: Optional[str] = None
         early_stopping_metric: Optional[str] = None
         early_stopping_value: Optional[float] = None
         best_validation_value_so_far: Optional[float] = None
 
         if test_loader is not None:
-            validation_metrics = evaluate(
+            validation_teacher_forced_metrics = evaluate_teacher_forced(
                 model=model,
                 loader=test_loader,
                 device=device,
             )
-            validation_accuracy = float(
-                validation_metrics["accuracy"]
+            validation_autoregressive_metrics = evaluate(
+                model=model,
+                loader=test_loader,
+                device=device,
             )
-            validation_macro_f1 = float(
-                validation_metrics["macro_f1"]
+            validation_teacher_forced_accuracy = float(
+                validation_teacher_forced_metrics["accuracy"]
+            )
+            validation_teacher_forced_macro_f1 = float(
+                validation_teacher_forced_metrics["macro_f1"]
+            )
+            validation_teacher_forced_confusion_matrix = json.dumps(
+                validation_teacher_forced_metrics[
+                    "confusion_matrix"
+                ]
+            )
+            validation_autoregressive_accuracy = float(
+                validation_autoregressive_metrics["accuracy"]
+            )
+            validation_autoregressive_macro_f1 = float(
+                validation_autoregressive_metrics["macro_f1"]
+            )
+            validation_autoregressive_confusion_matrix = json.dumps(
+                validation_autoregressive_metrics[
+                    "confusion_matrix"
+                ]
             )
             early_stopping_metric = (
                 config.early_stopping_metric
             )
             early_stopping_value = float(
-                validation_metrics[
+                validation_autoregressive_metrics[
                     config.early_stopping_metric
                 ]
             )
@@ -2341,10 +2452,14 @@ def train_model(
 
             print(
                 f"[VALIDATION] {run_name} | "
-                f"Accuracy "
-                f"{validation_accuracy:.4f} | "
-                f"Macro F1 "
-                f"{validation_macro_f1:.4f} | "
+                f"Teacher-forced accuracy "
+                f"{validation_teacher_forced_accuracy:.4f} | "
+                f"Teacher-forced macro F1 "
+                f"{validation_teacher_forced_macro_f1:.4f} | "
+                f"Autoregressive accuracy "
+                f"{validation_autoregressive_accuracy:.4f} | "
+                f"Autoregressive macro F1 "
+                f"{validation_autoregressive_macro_f1:.4f} | "
                 f"Best {config.early_stopping_metric} "
                 f"{best_validation_metric:.4f} | "
                 f"Patience "
@@ -2366,11 +2481,23 @@ def train_model(
                 "epoch_seconds": (
                     epoch_elapsed
                 ),
-                "validation_accuracy": (
-                    validation_accuracy
+                "validation_teacher_forced_accuracy": (
+                    validation_teacher_forced_accuracy
                 ),
-                "validation_macro_f1": (
-                    validation_macro_f1
+                "validation_teacher_forced_macro_f1": (
+                    validation_teacher_forced_macro_f1
+                ),
+                "validation_teacher_forced_confusion_matrix": (
+                    validation_teacher_forced_confusion_matrix
+                ),
+                "validation_autoregressive_accuracy": (
+                    validation_autoregressive_accuracy
+                ),
+                "validation_autoregressive_macro_f1": (
+                    validation_autoregressive_macro_f1
+                ),
+                "validation_autoregressive_confusion_matrix": (
+                    validation_autoregressive_confusion_matrix
                 ),
                 "early_stopping_metric": (
                     early_stopping_metric
@@ -2413,24 +2540,36 @@ def train_model(
 
         print()
         print(
-            f"[EVAL] Starting autoregressive "
+            f"[EVAL] Starting teacher-forced and autoregressive "
             f"evaluation for {run_name}"
         )
 
-        metrics = evaluate(
+        teacher_forced_metrics = evaluate_teacher_forced(
+            model=model,
+            loader=test_loader,
+            device=device,
+        )
+        autoregressive_metrics = evaluate(
             model=model,
             loader=test_loader,
             device=device,
         )
 
+        metrics = {
+            "teacher_forced": teacher_forced_metrics,
+            "autoregressive": autoregressive_metrics,
+        }
+
         print(
             f"[EVAL] {run_name} | "
-            f"Accuracy "
-            f"{metrics['accuracy']:.4f} | "
-            f"Mean window accuracy "
-            f"{metrics['mean_window_accuracy']:.4f} | "
-            f"Macro F1 "
-            f"{metrics['macro_f1']:.4f}"
+            f"Teacher-forced accuracy "
+            f"{teacher_forced_metrics['accuracy']:.4f} | "
+            f"Teacher-forced macro F1 "
+            f"{teacher_forced_metrics['macro_f1']:.4f} | "
+            f"Autoregressive accuracy "
+            f"{autoregressive_metrics['accuracy']:.4f} | "
+            f"Autoregressive macro F1 "
+            f"{autoregressive_metrics['macro_f1']:.4f}"
         )
 
     return (
@@ -3068,16 +3207,42 @@ def train_pipeline(
                 "n_test_trials": (
                     len(test_trials)
                 ),
+                "teacher_forced_accuracy": (
+                    metrics[
+                        "teacher_forced"
+                    ]["accuracy"]
+                ),
+                "teacher_forced_macro_f1": (
+                    metrics[
+                        "teacher_forced"
+                    ]["macro_f1"]
+                ),
+                "autoregressive_accuracy": (
+                    metrics[
+                        "autoregressive"
+                    ]["accuracy"]
+                ),
+                "autoregressive_macro_f1": (
+                    metrics[
+                        "autoregressive"
+                    ]["macro_f1"]
+                ),
                 "accuracy": (
-                    metrics["accuracy"]
+                    metrics[
+                        "autoregressive"
+                    ]["accuracy"]
                 ),
                 "mean_window_accuracy": (
                     metrics[
+                        "autoregressive"
+                    ][
                         "mean_window_accuracy"
                     ]
                 ),
                 "macro_f1": (
-                    metrics["macro_f1"]
+                    metrics[
+                        "autoregressive"
+                    ]["macro_f1"]
                 ),
                 "seconds": fold_elapsed,
                 "split_audit": fold_audit,
